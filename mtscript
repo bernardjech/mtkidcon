@@ -1,0 +1,29 @@
+## Function which appends a string to a file
+:global appendToFile do={
+   :local time [/system clock get time]
+   :local hh [ :pick $time 0 2 ]
+   :local fname "$prefix/$hh.txt"
+   :if ([:len [/file find name=$fname]] > 0) do={
+     :local oldcontents [/file get $fname contents]
+     :local newcontents ($oldcontents . $append)
+     /file set $fname contents=$newcontents
+   } else= {
+     /system clock print file=$fname
+     /file set $fname contents=$append
+   }
+}
+
+## Function to return bytes up/down for a device
+:global getBytesUp do={
+  :local t [/system clock get time]
+  :local bup [/ip kid-control device get [find name=$n] bytes-up]
+  :local bdown [/ip kid-control device get [find name=$n] bytes-down]
+  :return "kid-control: $n $bup $bdown\r\n"
+}
+
+## Log kid-control data
+:log info [$getBytesUp n="xiaomi-dalibor"]
+:log info [$getBytesUp n="xiaomi-david"]
+:log info [$getBytesUp n="samsung-dalibor"]
+:log info [$getBytesUp n="lenovo-wifi"]
+/ip kid-control device reset-counters
