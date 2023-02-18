@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 
-"""Retrieves kid-control data from Mikrotik router and stores them in a DB
+"""Parses Mikrotik log with kid-control date lines and stores them in a DB
 
 It is assumed that the following script runs on a Mikrotik router periodically:
 
-    :local time [/system clock get time]
-    :local hh [ :pick $time 0 2 ]
-    :local mm [ :pick $time 3 5 ]
-    :local fname "/sdcard/$hh-$mm"
-    /execute {
-    /ip kid-control device remove [find where dynamic]
-    /ip kid-control device print detail
-    /ip kid-control device reset-counters
-    } file=$fname
+    :global getBytesUp do={
+      :local t [/system clock get time]
+      :local bup [/ip kid-control device get [find name=$n] bytes-up]
+      :local bdown [/ip kid-control device get [find name=$n] bytes-down]
+      :return "kid-control: $n bytes-up=$bup bytes-down=$bdown"
+    }
 
-It is further assumed that the user mtkidcon exists on the router and the user
-can SSH into the router using an SSH key. This script downloads all files
-produced by the aforementioned Mikrotik script, parses the files, and stores
-them in an SQLite database.
+    :log info [$getBytesUp n="xiaomi-dalibor"]
+    :log info [$getBytesUp n="xiaomi-david"]
+    :log info [$getBytesUp n="samsung-dalibor"]
+    :log info [$getBytesUp n="lenovo-wifi"]
+    /ip kid-control device reset-counters
+
+This script reads log lines produced by the Mikrotik router from standard input and stores them in an SQLite database.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging.config
-import argparse
-import sqlite3
-import tempfile
-import os
-import subprocess
+import argparse, sqlite3, sys, re
 
 logconfig = {
     'version': 1,
@@ -54,65 +50,38 @@ logconfig = {
     }
 }
 
-def parse_contents(contents):
-    "returns output of 'print detail' parsed into a dictionary"
-    h = {}
-    name = None
-    for l in contents.split():
-        if '=' in l:
-            (key, value) = l.split('=')
-            value = value.strip('"')
-            if key in ('bytes-down', 'bytes-up'):
-                if value.endswith('KiB'):
-                    value = float(value[:-3]) * 1024
-                elif value.endswith('MiB'):
-                    value = float(value[:-3]) * 1024 * 1024
-                elif value.endswith('GiB'):
-                    value = float(value[:-3]) * 1024 * 1024 * 1024
-                else:
-                    value = float(value)
-            if key == 'name':
-                name = value
-                h[name] = {}
-            else:
-                h[name][key] = value
-    return h
+class D(datetime):
+    "subclass of datetime which supplies a default year for strptime"
+    @classmethod
+    def strptime(cls, datestring, fmt):
+        d = datetime.strptime(datestring, fmt)
+        if d.year == 1900:
+            now = datetime.now()
+            d1 = d.replace(year=now.year)
+            d2 = d.replace(year=now.year-1)
+            td1 = d1 - now
+            td2 = d2 - now
+            if td1 < timedelta(0):
+                td1 = -td1
+            if td2 < timedelta(0):
+                td2 = -td2
+            if td1 > td2:
+                return d2
+            return d1
+        return d
 
-def process_file(cur, dirname, filename):
-    with open(os.path.join(dirname, filename), 'r') as fd:
-        contents = fd.read()
-    kc_dict = parse_contents(contents)
-    hh = filename[0:2]
-    mm = filename[3:5]
-    now = datetime.now()
-    dt = datetime(now.year, now.month, now.day, int(hh), int(mm))
-    if dt > now:
-        dt = datetime(now.year, now.month, now.day - 1, int(hh), int(mm))
-    for name in kc_dict.keys():
-        bytes_up, bytes_down = (0, 0)
-        if 'bytes-down' in kc_dict[name]:
-            bytes_down = kc_dict[name]['bytes-down']
-        if 'bytes-up' in kc_dict[name]:
-            bytes_up = kc_dict[name]['bytes-up']
-        cur.execute("""
-            INSERT INTO mtkidcon VALUES(datetime(?), ?, ?, ?)
-            ON CONFLICT(timestamp, name) DO
-            UPDATE SET bytes_up = ?, bytes_down = ?
-        """, (dt.isoformat(), name, bytes_up, bytes_down, bytes_up, bytes_down))
+def parse_bytes(value):
+    "parses bytes with units and returns bytes"
+    if value.endswith('KiB'):
+        return float(value[:-3]) * 1024
+    if value.endswith('MiB'):
+        return float(value[:-3]) * 1024 * 1024
+    if value.endswith('GiB'):
+        return float(value[:-3]) * 1024 * 1024 * 1024
+    return float(value)
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--router", default='router',
-                        help="Mikrotik router hostname")
-    parser.add_argument("--router-dir", default='sdcard',
-                        help="directory on router where kid-control data is")
-    parser.add_argument("--local-dir", default='disk1',
-                        help="directory in tmpdir where kid-control data is")
-    parser.add_argument("--ssh-key", default='ssh/mtkidcon',
-                        help="SSH key pathname for scp")
-    parser.add_argument("--ssh-user", default='mtkidcon',
-                        help="SSH key pathname for scp")
     parser.add_argument("--sqlite-db", default='mtkidcon.db',
                         help="SQLite database where to store retrieved data")
     parser.add_argument("--print",
@@ -140,18 +109,20 @@ def main():
         """, (args.print,)):
             print('{} {} {}'.format(row[0], row[1], row[2]))
         return
-    with tempfile.TemporaryDirectory() as td:
-        proc = subprocess.Popen(
-            ['scp', '-i', args.ssh_key, '-rq',
-             f'{args.ssh_user}@{args.router}:{args.router_dir}', td],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        (out, err) = proc.communicate()
-        if err:
-            logger.info("scp error: {}".format(err.decode('utf-8')))
-        dirname = os.path.join(td, args.local_dir)
-        for filename in os.listdir(dirname):
-            process_file(cur, dirname, filename)
+    for line in sys.stdin:
+        match = re.search(
+            '(\w\w\w \d\d \d\d:\d\d:\d\d) \S+ kid-control: (\S+) bytes-up=(\S+) bytes-down=(\S+)', line)
+        if match:
+            ts = D.strptime(match.group(1), '%b %d %H:%M:%S')
+            name = match.group(2)
+            bytes_up = parse_bytes(match.group(3))
+            bytes_down = parse_bytes(match.group(4))
+            cur.execute("""
+                INSERT INTO mtkidcon VALUES(datetime(?), ?, ?, ?)
+                ON CONFLICT(timestamp, name) DO
+                UPDATE SET bytes_up = ?, bytes_down = ?
+            """, (ts.isoformat(), name,
+                  bytes_up, bytes_down, bytes_up, bytes_down))
     con.commit()
     logger.info('stopped')
 

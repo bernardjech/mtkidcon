@@ -18,10 +18,9 @@
   :local t [/system clock get time]
   :local bup [/ip kid-control device get [find name=$n] bytes-up]
   :local bdown [/ip kid-control device get [find name=$n] bytes-down]
-  :return "kid-control: $n $bup $bdown\r\n"
+  :return "kid-control: $n bytes-up=$bup bytes-down=$bdown"
 }
 
-## Log kid-control data
 :log info [$getBytesUp n="xiaomi-dalibor"]
 :log info [$getBytesUp n="xiaomi-david"]
 :log info [$getBytesUp n="samsung-dalibor"]
